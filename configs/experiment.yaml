@@ -1,0 +1,147 @@
+# =============================================================================
+# FSO-MCS Predictor Experiment Configuration
+# =============================================================================
+# All physical and ML parameters are centralized here for reproducibility.
+# Reference: Dindar et al., "Hybrid Amplify and Forward TVWS RoFSO"
+# =============================================================================
+
+seed: 42
+
+# --- FSO Link Physical Parameters (from Dindar et al.) ---
+fso_link:
+  wavelength_m: 1.55e-6          # 1550 nm telecom wavelength
+  link_length_m: 800.0           # 800 m folded path (400 m to mirror, 400 m back)
+  tx_power_mw: 8.0               # 8 mW transmit power (9 dBm)
+  tx_aperture_m: 0.075           # 75 mm diameter plano-convex lens
+  rx_aperture_m: 0.075           # 75 mm receiver aperture
+  focal_length_m: 0.150          # 150 mm focal length
+  beam_waist_m: 0.030            # ~30 mm output beam diameter
+  responsivity_A_per_W: 0.9      # Typical InGaAs photodiode at 1550 nm
+  rx_noise_A2_per_Hz: 1.0e-24    # Thermal + shot noise PSD
+  bandwidth_hz: 6.0e6            # 6 MHz TVWS channel bandwidth
+  # From paper: receiver saturates at -3 dBm, link fails below -27 dBm
+  rx_saturation_dBm: -3.0
+  rx_sensitivity_dBm: -27.0
+
+# --- Atmospheric Turbulence Parameters ---
+turbulence:
+  # Cn2 regimes to simulate (m^{-2/3})
+  # Weak: ~1e-16 to 1e-15 (clear night)
+  # Moderate: ~1e-15 to 1e-14 (typical day)
+  # Strong: ~1e-14 to 1e-13 (hot midday over asphalt)
+  cn2_regimes:
+    weak:
+      cn2_range: [1.0e-16, 5.0e-16]
+      label: "Weak (clear night)"
+    moderate:
+      cn2_range: [1.0e-15, 5.0e-15]
+      label: "Moderate (typical day)"
+    strong:
+      cn2_range: [1.0e-14, 5.0e-14]
+      label: "Strong (hot midday)"
+    transition:
+      # Cn2 ramps from weak to strong over the sequence (sunrise/sunset)
+      cn2_range: [1.0e-16, 5.0e-14]
+      label: "Transitioning (sunrise/sunset)"
+
+  # Wind parameters for frozen flow temporal correlation
+  wind_speed_range_m_per_s: [1.0, 15.0]   # Typical ground-level wind speeds
+  wind_speed_default_m_per_s: 5.0
+
+  # Pointing error / mount wobble parameters
+  # From Dindar: mount settling + thermal drift cause additional fading
+  pointing_error:
+    enabled: true
+    jitter_std_urad: 50.0         # Mechanical jitter standard deviation
+    drift_rate_urad_per_s: 0.5    # Slow thermal drift
+
+# --- Dataset Generation ---
+dataset:
+  sample_rate_hz: 1000.0          # Channel samples per second
+  # This is the rate at which we sample the *fading process*, not the RF.
+  # 1 kHz is reasonable: GFDM frame duration is ~ms, and turbulence
+  # coherence time at 5 m/s wind is ~6 ms for 30mm beam.
+  
+  sequence_length_s: 600.0        # 10 minutes per sequence
+  num_sequences_per_regime: 20    # 20 x 10-min = 200 min per regime
+  
+  # Sliding window for NN input
+  window_size: 50                 # 50 samples of history (~50 ms at 1 kHz)
+  prediction_horizon: 5           # Predict MCS 5 samples ahead (~5 ms)
+  
+  # Context: SI estimation window
+  si_window_size: 200             # 200 ms window for SI estimation
+  # NOTE: This is intentionally longer than the prediction window.
+  # SI is a "slow" statistic that characterizes the regime.
+  
+  # Train/val/test split
+  train_fraction: 0.7
+  val_fraction: 0.15
+  test_fraction: 0.15
+
+# --- MCS Table (from Dindar et al. Table I) ---
+# SNR thresholds include 1 dB hysteresis margin for stability
+mcs:
+  hysteresis_dB: 1.0
+  # Entries defined in code (mcs_table.py) from the paper
+
+# --- Neural Network Training ---
+training:
+  batch_size: 256
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  max_epochs: 100
+  early_stopping_patience: 10
+  scheduler: "cosine"              # cosine or step
+  num_workers: 4
+
+# --- Model Architectures ---
+models:
+  lstm:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.2
+    bidirectional: false
+    use_context: true              # Feed SI as auxiliary input
+
+  gru:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.2
+    bidirectional: false
+    use_context: true
+
+  transformer:
+    d_model: 64
+    nhead: 4
+    num_encoder_layers: 3
+    dim_feedforward: 128
+    dropout: 0.1
+    use_context: true
+
+  esn:
+    reservoir_size: 500
+    spectral_radius: 0.95
+    input_scaling: 0.1
+    leak_rate: 0.3
+    use_context: true
+
+  tcn:
+    num_channels: [64, 64, 64]     # Channels per TCN layer
+    kernel_size: 3
+    dropout: 0.2
+    use_context: true
+
+# --- Evaluation ---
+evaluation:
+  # Compare against reactive baseline (current SNR → MCS, no prediction)
+  baseline: "reactive"
+  metrics:
+    - "mcs_accuracy"               # Exact MCS match
+    - "mcs_accuracy_within_1"      # Within ±1 MCS level
+    - "effective_throughput"        # Throughput accounting for BER
+    - "outage_rate"                # Fraction of frames with BER > 1e-3
+    - "confusion_matrix"
+  
+  # Per-regime evaluation
+  per_regime: true
