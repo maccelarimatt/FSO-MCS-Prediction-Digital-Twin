@@ -18,7 +18,6 @@ Key references:
     SPIE Press, 2nd ed., 2005. (Chapters 8-10)
   - Cox et al., "Structured Light in Turbulence," IEEE JSTQE, 2021.
   - Trichili et al., "Roadmap to Free Space Optics," JOSA B, 2020.
-  - aotools: https://github.com/AOtools/aotools (Von Karman spectrum)
 """
 
 import numpy as np
