@@ -331,6 +331,8 @@ class DatasetGenerator:
             power_levels_dBm = [mean_rx_power_dBm]
         
         all_features, all_targets, all_si, all_labels, all_raw_snr = [], [], [], [], []
+        # Track which realisation each chunk belongs to, for leakage-free splitting
+        chunk_run_ids = []  # (regime_name, power, realisation_index)
         
         print(f"Generating datasets for regimes: {regimes}")
         print(f"  Power levels: {power_levels_dBm} dBm")
@@ -358,6 +360,7 @@ class DatasetGenerator:
                     all_labels.append(
                         np.full(len(targets), regime_name, dtype=object)
                     )
+                    chunk_run_ids.append((regime_name, power_dBm, r))
                     print(f"{len(targets)} windows")
         
         if include_transitions and len(regimes) >= 2:
@@ -382,62 +385,116 @@ class DatasetGenerator:
                 all_labels.append(
                     np.full(len(targets), f"trans_{s}_{e}", dtype=object)
                 )
+                chunk_run_ids.append((f"trans_{s}_{e}", mid_power, 0))
                 print(f"{len(targets)} windows")
         
-        # Concatenate and shuffle
-        features = np.concatenate(all_features, axis=0)
-        targets = np.concatenate(all_targets, axis=0)
-        si_vals = np.concatenate(all_si, axis=0)
-        raw_snr = np.concatenate(all_raw_snr, axis=0)
-        labels = np.concatenate(all_labels, axis=0)
+        # --- Realisation-level split (prevents data leakage) ---
+        # Each 300s realisation is an independent channel simulation.
+        # Entire realisations go to train, val, or test — never split
+        # across sets. This ensures zero overlap between splits.
+        #
+        # With 3 realisations per regime per power level:
+        #   Realisation 0, 1 → train  (67%)
+        #   Realisation 2    → split into val (first half) and test (second half)
+        # Transitions always go to train (unique, don't need evaluation).
         
-        perm = self.rng.permutation(len(targets))
-        features, targets, si_vals, raw_snr, labels = (
-            features[perm], targets[perm], si_vals[perm], 
-            raw_snr[perm], labels[perm]
-        )
+        train_chunks = {"f": [], "t": [], "s": [], "l": [], "r": []}
+        val_chunks   = {"f": [], "t": [], "s": [], "l": [], "r": []}
+        test_chunks  = {"f": [], "t": [], "s": [], "l": [], "r": []}
         
-        # Split
-        n = len(targets)
-        n_train = int(n * self.cfg.train_fraction)
-        n_val = int(n * self.cfg.val_fraction)
+        for i, (run_id) in enumerate(chunk_run_ids):
+            regime_name, power, real_idx = run_id
+            
+            if regime_name.startswith("trans_"):
+                # Transitions → training only
+                dest = train_chunks
+            elif n_realisations_per_regime == 1:
+                # Only 1 realisation (quick mode): split by time with gaps
+                # to prevent window overlap between splits.
+                # First 60% → train, skip gap, next 20% → val, skip gap, last 20% → test
+                n_win = len(all_targets[i])
+                gap = self.cfg.window_size  # gap = window_size to prevent overlap
+                n_tr = int(n_win * 0.6)
+                n_va = int(n_win * 0.2)
+                
+                for key, arr in zip(
+                    ["f", "t", "s", "l", "r"],
+                    [all_features[i], all_targets[i], all_si[i], 
+                     all_labels[i], all_raw_snr[i]]
+                ):
+                    train_chunks[key].append(arr[:n_tr])
+                    val_start = n_tr + gap
+                    val_end = val_start + n_va
+                    if val_end <= n_win:
+                        val_chunks[key].append(arr[val_start:val_end])
+                    test_start = val_end + gap
+                    if test_start < n_win:
+                        test_chunks[key].append(arr[test_start:])
+                continue
+            elif real_idx < n_realisations_per_regime - 1:
+                # Realisations 0..N-2 → training
+                dest = train_chunks
+            else:
+                # Last realisation → split into val (first half) / test (second half)
+                n_windows = len(all_targets[i])
+                mid = n_windows // 2
+                
+                for key, arr in zip(
+                    ["f", "t", "s", "l", "r"],
+                    [all_features[i], all_targets[i], all_si[i], 
+                     all_labels[i], all_raw_snr[i]]
+                ):
+                    val_chunks[key].append(arr[:mid])
+                    test_chunks[key].append(arr[mid:])
+                continue
+            
+            # Append to destination
+            for key, arr in zip(
+                ["f", "t", "s", "l", "r"],
+                [all_features[i], all_targets[i], all_si[i], 
+                 all_labels[i], all_raw_snr[i]]
+            ):
+                dest[key].append(arr)
         
-        def _slice(arr, a, b):
-            return arr[a:b]
+        def _concat_and_shuffle(chunks):
+            if not chunks["f"]:
+                return None
+            f = np.concatenate(chunks["f"])
+            t = np.concatenate(chunks["t"])
+            s = np.concatenate(chunks["s"])
+            l = np.concatenate(chunks["l"])
+            r = np.concatenate(chunks["r"])
+            # Shuffle within the split (not across splits)
+            perm = self.rng.permutation(len(t))
+            return f[perm], t[perm], s[perm], l[perm], r[perm]
         
-        train_ds = FSODataset(
-            _slice(features, 0, n_train), _slice(targets, 0, n_train),
-            _slice(si_vals, 0, n_train), _slice(labels, 0, n_train),
-            _slice(raw_snr, 0, n_train),
-        )
-        val_ds = FSODataset(
-            _slice(features, n_train, n_train+n_val),
-            _slice(targets, n_train, n_train+n_val),
-            _slice(si_vals, n_train, n_train+n_val),
-            _slice(labels, n_train, n_train+n_val),
-            _slice(raw_snr, n_train, n_train+n_val),
-        )
-        test_ds = FSODataset(
-            _slice(features, n_train+n_val, n),
-            _slice(targets, n_train+n_val, n),
-            _slice(si_vals, n_train+n_val, n),
-            _slice(labels, n_train+n_val, n),
-            _slice(raw_snr, n_train+n_val, n),
-        )
+        tr = _concat_and_shuffle(train_chunks)
+        va = _concat_and_shuffle(val_chunks)
+        te = _concat_and_shuffle(test_chunks)
         
-        unique, counts = np.unique(targets, return_counts=True)
+        train_ds = FSODataset(tr[0], tr[1], tr[2], tr[3], tr[4])
+        val_ds   = FSODataset(va[0], va[1], va[2], va[3], va[4])
+        test_ds  = FSODataset(te[0], te[1], te[2], te[3], te[4])
+        
+        n_train, n_val, n_test = len(tr[1]), len(va[1]), len(te[1])
+        n = n_train + n_val + n_test
+        
+        features_all = np.concatenate([tr[0], va[0], te[0]])
+        targets_all = np.concatenate([tr[1], va[1], te[1]])
+        unique, counts = np.unique(targets_all, return_counts=True)
         stats = {
             "n_total": n,
             "n_train": n_train,
             "n_val": n_val,
-            "n_test": n - n_train - n_val,
-            "n_features": features.shape[-1],
-            "seq_length": features.shape[1],
+            "n_test": n_test,
+            "n_features": tr[0].shape[-1],
+            "seq_length": tr[0].shape[1],
             "class_distribution": dict(zip(unique.tolist(), counts.tolist())),
+            "split_method": "realisation-level (no data leakage)",
         }
         
-        print(f"\nDataset: {n} total ({n_train} train / {n_val} val / "
-              f"{n - n_train - n_val} test)")
-        print(f"Shape: ({features.shape[1]}, {features.shape[2]}) per sample")
+        print(f"\nDataset: {n} total ({n_train} train / {n_val} val / {n_test} test)")
+        print(f"  Split: realisation-level (train/test from independent channel runs)")
+        print(f"Shape: ({tr[0].shape[1]}, {tr[0].shape[2]}) per sample")
         
         return train_ds, val_ds, test_ds, stats
