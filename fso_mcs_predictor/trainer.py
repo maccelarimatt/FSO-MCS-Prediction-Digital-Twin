@@ -21,6 +21,46 @@ from .models.esn import EchoStateNetwork
 from .dataset.generator import FSODataset
 
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss (Lin et al., 2017) — downweights easy examples to
+    focus training on hard boundary cases between adjacent MCS levels.
+    
+    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
+    
+    When γ = 0, this is standard weighted cross-entropy.
+    When γ > 0, easy examples (p_t ≈ 1) get downweighted.
+    γ = 2 is the standard choice from the original paper.
+    
+    Why this helps for MCS prediction:
+      Standard CE treats a confident correct prediction of class 0
+      (outage, very distinct SNR) the same as a correct prediction
+      of class 6 vs class 7 (16QAM R=2/3 vs R=3/4, only 1 dB apart).
+      Focal loss reduces the gradient contribution from the easy
+      cases and concentrates learning on the hard boundaries.
+    """
+    
+    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.register_buffer('weight', weight)
+    
+    def forward(self, logits, targets):
+        ce_loss = nn.functional.cross_entropy(
+            logits, targets, weight=self.weight, reduction='none'
+        )
+        pt = torch.exp(-ce_loss)  # probability of correct class
+        focal_weight = (1 - pt) ** self.gamma
+        loss = focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
 class Trainer:
     """
     Trains and validates MCS predictor models.
@@ -68,9 +108,29 @@ class Trainer:
         
         # Class weights to handle imbalanced MCS distribution
         class_weights = self._compute_class_weights(train_dataset)
-        self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights.to(self.device)
-        )
+        
+        # Check for rare classes and warn
+        targets = train_dataset.targets.numpy()
+        class_counts = np.bincount(targets, minlength=NUM_MCS_CLASSES)
+        rare_classes = [c for c in range(NUM_MCS_CLASSES) 
+                       if class_counts[c] < self.config.min_class_samples 
+                       and class_counts[c] > 0]
+        if rare_classes:
+            print(f"  [WARNING] Classes {rare_classes} have < {self.config.min_class_samples} "
+                  f"training samples. Counts: {[int(class_counts[c]) for c in rare_classes]}")
+            print(f"  These classes may have 0% accuracy — this is expected at this operating point.")
+        
+        # Loss function
+        if self.config.use_focal_loss:
+            self.criterion = FocalLoss(
+                weight=class_weights.to(self.device),
+                gamma=self.config.focal_gamma,
+            )
+            print(f"  Using Focal Loss (γ={self.config.focal_gamma})")
+        else:
+            self.criterion = nn.CrossEntropyLoss(
+                weight=class_weights.to(self.device)
+            )
         
         # Optimizer and scheduler
         self.optimizer = optim.AdamW(
@@ -97,14 +157,23 @@ class Trainer:
         Compute inverse-frequency class weights.
         Classes that appear less often get higher weight so the model
         doesn't just predict the most common MCS level.
+        
+        Classes with zero samples get zero weight (no gradient signal).
         """
         targets = dataset.targets.numpy()
         class_counts = np.bincount(targets, minlength=NUM_MCS_CLASSES)
-        # Avoid division by zero
-        class_counts = np.maximum(class_counts, 1)
-        weights = 1.0 / class_counts.astype(np.float32)
-        weights /= weights.sum()  # normalise
-        weights *= len(weights)   # scale so mean weight ≈ 1
+        
+        # Avoid division by zero — zero-count classes get zero weight
+        weights = np.zeros(NUM_MCS_CLASSES, dtype=np.float32)
+        for c in range(NUM_MCS_CLASSES):
+            if class_counts[c] > 0:
+                weights[c] = 1.0 / class_counts[c]
+        
+        # Normalise so mean of active weights ≈ 1
+        active = weights > 0
+        if active.any():
+            weights[active] /= weights[active].mean()
+        
         return torch.FloatTensor(weights)
     
     def train(self) -> Dict:

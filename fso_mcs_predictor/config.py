@@ -189,6 +189,9 @@ class TrainingConfig:
     num_workers: int = 4
     seed: int = 42
     device: str = "auto"            # "auto", "cpu", "cuda"
+    use_focal_loss: bool = False    # focal loss — experimental, can destabilise
+    focal_gamma: float = 1.0        # lower gamma is safer (0 = standard CE)
+    min_class_samples: int = 100    # warn about rare classes
 
 
 # ---------------------------------------------------------------------------

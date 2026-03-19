@@ -303,6 +303,7 @@ class DatasetGenerator:
         regimes: Optional[List[str]] = None,
         include_transitions: bool = True,
         mean_rx_power_dBm: float = -10.0,
+        power_levels_dBm: Optional[List[float]] = None,
         n_realisations_per_regime: int = 3,
     ) -> Tuple[FSODataset, FSODataset, FSODataset, Dict]:
         """
@@ -311,8 +312,13 @@ class DatasetGenerator:
         Args:
             regimes: Regime names (default: all four).
             include_transitions: Include transition scenarios.
-            mean_rx_power_dBm: Mean Rx power for the link.
-            n_realisations_per_regime: Independent channel runs per regime.
+            mean_rx_power_dBm: Mean Rx power (used if power_levels_dBm is None).
+            power_levels_dBm: List of power levels to generate data for.
+                             If provided, generates one realisation per regime
+                             per power level. This ensures all MCS classes are
+                             well-represented: high power populates high MCS,
+                             low power populates low MCS and outage.
+            n_realisations_per_regime: Independent channel runs per regime per power level.
         
         Returns:
             train_dataset, val_dataset, test_dataset, stats_dict
@@ -320,40 +326,50 @@ class DatasetGenerator:
         if regimes is None:
             regimes = list(TURBULENCE_REGIMES.keys())
         
+        # If a single power is given, wrap it in a list
+        if power_levels_dBm is None:
+            power_levels_dBm = [mean_rx_power_dBm]
+        
         all_features, all_targets, all_si, all_labels, all_raw_snr = [], [], [], [], []
         
         print(f"Generating datasets for regimes: {regimes}")
+        print(f"  Power levels: {power_levels_dBm} dBm")
         print(f"  {n_realisations_per_regime} realisations × "
-              f"{self.cfg.duration_s}s each")
+              f"{self.cfg.duration_s}s each per power level")
         
-        for regime_name in regimes:
-            regime = TURBULENCE_REGIMES[regime_name]
-            for r in range(n_realisations_per_regime):
-                print(f"  {regime_name} [{r+1}/{n_realisations_per_regime}]...",
-                      end=" ", flush=True)
-                data = self.generate_regime_data(
-                    regime, mean_rx_power_dBm=mean_rx_power_dBm
-                )
-                features, targets, si_vals, raw_snr = self._extract_windows(data)
-                if len(features) == 0:
-                    print("skipped (too short)")
-                    continue
-                all_features.append(features)
-                all_targets.append(targets)
-                all_si.append(si_vals)
-                all_raw_snr.append(raw_snr)
-                all_labels.append(
-                    np.full(len(targets), regime_name, dtype=object)
-                )
-                print(f"{len(targets)} windows")
+        for power_dBm in power_levels_dBm:
+            print(f"\n  --- Power level: {power_dBm} dBm ---")
+            for regime_name in regimes:
+                regime = TURBULENCE_REGIMES[regime_name]
+                for r in range(n_realisations_per_regime):
+                    print(f"  {regime_name} [{r+1}/{n_realisations_per_regime}] "
+                          f"@ {power_dBm} dBm...", end=" ", flush=True)
+                    data = self.generate_regime_data(
+                        regime, mean_rx_power_dBm=power_dBm
+                    )
+                    features, targets, si_vals, raw_snr = self._extract_windows(data)
+                    if len(features) == 0:
+                        print("skipped (too short)")
+                        continue
+                    all_features.append(features)
+                    all_targets.append(targets)
+                    all_si.append(si_vals)
+                    all_raw_snr.append(raw_snr)
+                    all_labels.append(
+                        np.full(len(targets), regime_name, dtype=object)
+                    )
+                    print(f"{len(targets)} windows")
         
         if include_transitions and len(regimes) >= 2:
+            # Generate transitions at the middle power level
+            mid_power = power_levels_dBm[len(power_levels_dBm) // 2]
             for i in range(len(regimes) - 1):
                 s, e = regimes[i], regimes[i + 1]
-                print(f"  transition {s} → {e}...", end=" ", flush=True)
+                print(f"  transition {s} → {e} @ {mid_power} dBm...", 
+                      end=" ", flush=True)
                 data = self.generate_transition_data(
                     TURBULENCE_REGIMES[s], TURBULENCE_REGIMES[e],
-                    mean_rx_power_dBm=mean_rx_power_dBm,
+                    mean_rx_power_dBm=mid_power,
                 )
                 features, targets, si_vals, raw_snr = self._extract_windows(data)
                 if len(features) == 0:

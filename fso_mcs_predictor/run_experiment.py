@@ -27,6 +27,7 @@ from fso_mcs_predictor.channel.turbulence import TurbulenceParameters
 from fso_mcs_predictor.dataset.generator import DatasetGenerator
 from fso_mcs_predictor.models import create_model, list_models
 from fso_mcs_predictor.models.baseline import run_baseline_sweep
+from fso_mcs_predictor.models.hybrid_selector import HybridMCSSelector
 from fso_mcs_predictor.trainer import Trainer
 from fso_mcs_predictor.evaluator import Evaluator
 
@@ -64,6 +65,10 @@ def parse_args():
         help="Prediction horizon in samples (at 10 kHz: 1=0.1ms, 10=1ms, 50=5ms). "
              "Controls how far ahead the NN predicts. The reactive baseline "
              "with the same delay is the thing to beat."
+    )
+    parser.add_argument(
+        "--focal-loss", action="store_true",
+        help="Use focal loss instead of standard weighted cross-entropy (experimental)."
     )
     return parser.parse_args()
 
@@ -111,6 +116,8 @@ def main():
     print("  STEP 1: Generating Dataset")
     print("=" * 60)
 
+    focal = args.focal_loss
+    
     if args.quick:
         ds_config = DatasetConfig(
             duration_s=30.0, window_size=50, si_window_size=200,
@@ -119,7 +126,10 @@ def main():
             include_si_context=not args.no_context,
         )
         n_real = 1
-        train_config = TrainingConfig(max_epochs=10, batch_size=128, patience=5)
+        train_config = TrainingConfig(
+            max_epochs=10, batch_size=128, patience=5,
+            use_focal_loss=focal,
+        )
     else:
         ds_config = DatasetConfig(
             duration_s=300.0, window_size=100, si_window_size=500,
@@ -128,7 +138,7 @@ def main():
             include_si_context=not args.no_context,
         )
         n_real = 3
-        train_config = TrainingConfig()
+        train_config = TrainingConfig(use_focal_loss=focal)
 
     gen = DatasetGenerator(dataset_config=ds_config, seed=args.seed)
     t0 = time.time()
@@ -197,6 +207,29 @@ def main():
         Evaluator.save_results(results, str(output_dir / f"{model_name}_results.json"))
         torch.save(model.state_dict(), output_dir / f"{model_name}_best.pt")
         all_results.append(results)
+
+        # Also evaluate the hybrid NN+reactive selector for this model
+        # This combines the NN for volatile conditions with reactive for stable
+        if test_ds.raw_snr_windows is not None:
+            model.eval()
+            with torch.no_grad():
+                device = next(model.parameters()).device
+                all_preds = []
+                from torch.utils.data import DataLoader
+                loader = DataLoader(test_ds, batch_size=512, shuffle=False)
+                for feats, _ in loader:
+                    logits = model(feats.to(device))
+                    all_preds.append(logits.argmax(dim=-1).cpu().numpy())
+                nn_preds = np.concatenate(all_preds)
+
+            hybrid = HybridMCSSelector(si_threshold=0.05)
+            hybrid_results = hybrid.evaluate_on_dataset(nn_preds, test_ds)
+            hybrid_results["model_name"] = f"Hybrid_{model_name}"
+            hybrid_results["training_time_s"] = results["training_time_s"]
+            stable_pct = hybrid_results["stable_fraction"] * 100
+            print(f"\n  Hybrid ({model_name}): {hybrid_results['throughput_ratio']:.1%} throughput "
+                  f"({stable_pct:.0f}% reactive / {100-stable_pct:.0f}% NN)")
+            all_results.append(hybrid_results)
 
     # --- 4. Compare ---
     print("\n" + "=" * 60)
