@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-<<<<<<< HEAD
 FSO-TVWS MCS Prediction Digital Twin — Main Runner
 
 Usage:
@@ -258,21 +257,6 @@ def plot_bar_summary(results, output_dir, horizon):
     plt.close(fig)
     print(f"Saved: {path}")
 
-=======
-Run the FSO-TVWS MCS Prediction experiment.
-
-Usage (from repo root):
-    python run.py                                    # full experiment
-    python run.py --quick --models gru lstm          # quick test
-    python run.py --no-context --output-dir results_ablation
-    python run.py --mean-rx-power -15 --output-dir results_low_power
-
-This is a convenience wrapper so you don't need:
-    python -m fso_mcs_predictor.run_experiment
-"""
-
-from fso_mcs_predictor.run_experiment import main
->>>>>>> 74334969080a49abe0fa27248652f80d22e6b8d6
 
 if __name__ == "__main__":
     main()
